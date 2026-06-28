@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html lang="en">
 <head>
@@ -126,7 +127,7 @@
 <body>
   <main>
     <h1>Email MIME Automation</h1>
-    <p>Paste or upload a raw email and convert it with a single click. All processing happens locally in your browser.</p>
+    <p>Paste or upload a raw email and convert it to the required format in one click. All processing happens inside your browser.</p>
 
     <div class="toolbar">
       <label class="file-button" for="fileInput">Open .txt / .eml</label>
@@ -151,12 +152,15 @@
     </section>
 
     <details>
-      <summary>Automation Rules</summary>
+      <summary>Automation rules</summary>
       <p>
         Top-level headers: <code>Subject: {sub}</code>, <code>From: "{from}" &lt;{listid}&gt;</code>,
-        <code>Date: {hdt}</code>, <code>To: {to}</code>. If the HTML part is Base64 encoded, decode it as UTF-8 and
-        <code>Content-Transfer-Encoding: 7bit</code> convert it to  <code>&lt;/style&gt;</code> tag-ஐ
-        HTML முடிவுக்கு நகர்த்தி, இறுதி closing MIME boundary-ஐ நீக்கும்.
+        <code>Date: {hdt}</code>, <code>To: {to}</code>. If the HTML part is Base64 or quoted-printable, it is decoded as UTF-8 and
+        changed to <code>Content-Transfer-Encoding: 7bit</code>. If <code>&lt;/style&gt;</code> is present, all inner
+        closing style tags are removed and one closing style tag is placed at the end. If it is not present in a full
+        HTML document, the body is kept visible. Non-document fragments without a closing style tag are hidden inside a
+        comment tag.
+        If a MIME boundary exists, the final closing boundary is removed.
       </p>
     </details>
   </main>
@@ -180,7 +184,14 @@
 
     function splitHeaderAndBody(raw) {
       const match = raw.match(/\r?\n\r?\n/);
-      if (!match) throw new Error("Email header/body separator not found.");
+      if (!match) {
+        return {
+          headers: raw.trimEnd(),
+          separator: "",
+          body: ""
+        };
+      }
+      if (!match) throw new Error("Email header/body separator was not found.");
       return {
         headers: raw.slice(0, match.index),
         separator: match[0],
@@ -215,12 +226,38 @@
     function decodeBase64Utf8(encoded) {
       const clean = encoded.replace(/\s+/g, "");
       if (!clean || !/^[A-Za-z0-9+/]*={0,2}$/.test(clean)) {
-        throw new Error("The HTML part does not contain valid Base64 content.");
+        throw new Error("HTML part does not contain valid Base64 content.");
       }
 
       const binary = atob(clean);
       const bytes = Uint8Array.from(binary, character => character.charCodeAt(0));
       return new TextDecoder("utf-8").decode(bytes);
+    }
+
+    function decodeQuotedPrintableUtf8(encoded) {
+      const bytes = [];
+      const encoder = new TextEncoder();
+
+      for (let index = 0; index < encoded.length; index += 1) {
+        const character = encoded[index];
+        const nextTwo = encoded.slice(index + 1, index + 3);
+
+        if (character === "=" && /^\r?\n/.test(encoded.slice(index + 1))) {
+          if (encoded[index + 1] === "\r") index += 2;
+          else index += 1;
+          continue;
+        }
+
+        if (character === "=" && /^[0-9A-Fa-f]{2}$/.test(nextTwo)) {
+          bytes.push(parseInt(nextTwo, 16));
+          index += 2;
+          continue;
+        }
+
+        bytes.push(...encoder.encode(character));
+      }
+
+      return new TextDecoder("utf-8").decode(new Uint8Array(bytes));
     }
 
     // 7bit must contain ASCII only. Numeric entities keep Unicode text and emoji readable.
@@ -232,10 +269,29 @@
     }
 
     function moveClosingStyleToEnd(body) {
-      const stylePattern = /<\/style\s*>/i;
-      if (!stylePattern.test(body)) return { body, moved: false };
-      const withoutFirstTag = body.replace(stylePattern, "");
-      return { body: `${withoutFirstTag.trimEnd()}</style>`, moved: true };
+      const stylePattern = /(?:<\/style\s*>|&lt;\/style\s*&gt;|=3C\/style\s*=3E)/i;
+      const allStyleCloseTags = /(?:<\/style\s*>|&lt;\/style\s*&gt;|=3C\/style\s*=3E)/gi;
+      if (!stylePattern.test(body)) {
+        const hasHtmlDocument = /(?:<!doctype\s+html\b|<html\b|<body\b)/i.test(body);
+        if (hasHtmlDocument) {
+          return {
+            body: body.trimEnd(),
+            moved: false,
+            commented: false
+          };
+        }
+        return {
+          body: `<!--${body.trimEnd()}-->`,
+          moved: false,
+          commented: true
+        };
+      }
+      const withoutStyleCloseTags = body.replace(allStyleCloseTags, "");
+      return {
+        body: `${withoutStyleCloseTags.trimEnd()}</style>`,
+        moved: true,
+        commented: false
+      };
     }
 
     function processHtmlParts(body, boundary, newline) {
@@ -243,6 +299,7 @@
       const parts = body.split(delimiter);
       let decodedCount = 0;
       let styleMoveCount = 0;
+      let commentWrapCount = 0;
 
       for (let index = 1; index < parts.length; index += 1) {
         let part = parts[index];
@@ -259,6 +316,7 @@
         if (!/^Content-Type:\s*text\/html\b/im.test(partHeaders)) continue;
 
         const isBase64 = /^Content-Transfer-Encoding:\s*base64\s*$/im.test(partHeaders);
+        const isQuotedPrintable = /^Content-Transfer-Encoding:\s*quoted-printable\s*$/im.test(partHeaders);
         if (isBase64) {
           partBody = makeSevenBitSafe(decodeBase64Utf8(partBody));
           partHeaders = partHeaders.replace(
@@ -267,15 +325,24 @@
           );
           decodedCount += 1;
         }
+        if (isQuotedPrintable) {
+          partBody = makeSevenBitSafe(decodeQuotedPrintableUtf8(partBody));
+          partHeaders = partHeaders.replace(
+            /^Content-Transfer-Encoding:\s*quoted-printable\s*$/im,
+            "Content-Transfer-Encoding: 7bit"
+          );
+          decodedCount += 1;
+        }
 
         const moved = moveClosingStyleToEnd(partBody);
         partBody = moved.body;
         if (moved.moved) styleMoveCount += 1;
+        if (moved.commented) commentWrapCount += 1;
 
         parts[index] = `${leadingNewline}${partHeaders}${newline}${newline}${partBody}${newline}`;
       }
 
-      return { body: parts.join(delimiter), decodedCount, styleMoveCount };
+      return { body: parts.join(delimiter), decodedCount, styleMoveCount, commentWrapCount };
     }
 
     function convertEmail(raw) {
@@ -283,53 +350,72 @@
 
       const newline = raw.includes("\r\n") ? "\r\n" : "\n";
       const parsed = splitHeaderAndBody(raw);
-
       let headers = parsed.headers;
-      headers = replaceHeader(headers,"Subject","{sub}");
-      headers = replaceHeader(headers,"From","\"{from}\" <{listid}>");
-      headers = replaceHeader(headers,"Date","{hdt}");
-      headers = replaceHeader(headers,"To","{to}");
 
-      const unfoldedHeaders=headers.replace(/\r?\n[ \t]+/g," ");
+      headers = replaceHeader(headers, "Subject", "{sub}");
+      headers = replaceHeader(headers, "From", "\"{from}\" <{listid}>");
+      headers = replaceHeader(headers, "Date", "{hdt}");
+      headers = replaceHeader(headers, "To", "{to}");
 
-      const boundaryMatch=unfoldedHeaders.match(
+      const unfoldedHeaders = headers.replace(/\r?\n[ \t]+/g, " ");
+      const boundaryMatch = unfoldedHeaders.match(
         /Content-Type:\s*multipart\/[^;\r\n]+;[\s\S]*?\bboundary\s*=\s*(?:"([^"]+)"|([^;\s]+))/i
       );
 
-      let body=parsed.body;
-      let decodedCount=0;
-      let styleMoveCount=0;
-      let boundaryRemoved=false;
+      if (!boundaryMatch) {
+        const isHtmlBody = /^Content-Type:\s*text\/html\b/im.test(unfoldedHeaders);
+        const isBase64 = /^Content-Transfer-Encoding:\s*base64\s*$/im.test(headers);
+        const isQuotedPrintable = /^Content-Transfer-Encoding:\s*quoted-printable\s*$/im.test(headers);
+        let body = parsed.body;
+        let decodedCount = 0;
 
-      if(boundaryMatch){
-        const boundary=boundaryMatch[1]||boundaryMatch[2];
-        const processed=processHtmlParts(parsed.body,boundary,newline);
-        body=processed.body;
-        decodedCount=processed.decodedCount;
-        styleMoveCount=processed.styleMoveCount;
-
-        const esc=boundary.replace(/[.*+?^${}()|[\]\\]/g,"\\$&");
-        const re=new RegExp(`(?:\\r?\\n)?--${esc}--[ \\t]*(?:\\r?\\n)*$`);
-        boundaryRemoved=re.test(body);
-        body=body.replace(re,"").trimEnd();
-      }else{
-        const isHtml=/^Content-Type:\s*text\/html\b/im.test(headers);
-        const isB64=/^Content-Transfer-Encoding:\s*base64\s*$/im.test(headers);
-        if(isHtml && isB64){
-          body=makeSevenBitSafe(decodeBase64Utf8(body));
-          headers=headers.replace(/^Content-Transfer-Encoding:\s*base64\s*$/im,"Content-Transfer-Encoding: 7bit");
-          const moved=moveClosingStyleToEnd(body);
-          body=moved.body;
-          decodedCount=1;
-          if(moved.moved) styleMoveCount=1;
+        if (isHtmlBody && isBase64 && body) {
+          body = makeSevenBitSafe(decodeBase64Utf8(body));
+          headers = headers.replace(
+            /^Content-Transfer-Encoding:\s*base64\s*$/im,
+            "Content-Transfer-Encoding: 7bit"
+          );
+          decodedCount = 1;
         }
+        if (isHtmlBody && isQuotedPrintable && body) {
+          body = makeSevenBitSafe(decodeQuotedPrintableUtf8(body));
+          headers = headers.replace(
+            /^Content-Transfer-Encoding:\s*quoted-printable\s*$/im,
+            "Content-Transfer-Encoding: 7bit"
+          );
+          decodedCount = 1;
+        }
+
+        const transformed = isHtmlBody && body
+          ? moveClosingStyleToEnd(body)
+          : { body: parsed.body, moved: false, commented: false };
+
+        return {
+          result: `${headers}${newline}${newline}${transformed.body}`,
+          decodedCount,
+          styleMoveCount: transformed.moved ? 1 : 0,
+          commentWrapCount: transformed.commented ? 1 : 0,
+          boundaryRemoved: false
+        };
       }
 
+      const boundary = boundaryMatch[1] || boundaryMatch[2];
+      const processed = processHtmlParts(parsed.body, boundary, newline);
+
+      // Remove only the final closing boundary line and trailing whitespace.
+      const escapedBoundary = boundary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const finalBoundary = new RegExp(
+        `(?:\\r?\\n)?--${escapedBoundary}--[ \\t]*(?:\\r?\\n)*$`
+      );
+      const bodyWithoutClosingBoundary = processed.body.replace(finalBoundary, "").trimEnd();
+      const result = `${headers}${newline}${newline}${bodyWithoutClosingBoundary}`;
+
       return {
-        result:`${headers}${newline}${newline}${body}`,
-        decodedCount,
-        styleMoveCount,
-        boundaryRemoved
+        result,
+        decodedCount: processed.decodedCount,
+        styleMoveCount: processed.styleMoveCount,
+        commentWrapCount: processed.commentWrapCount,
+        boundaryRemoved: true
       };
     }
 
@@ -339,10 +425,21 @@
         output.value = converted.result;
         updateCounts();
         const encodingMessage = converted.decodedCount
-          ? `${converted.decodedCount} Base64 HTML part decoded and converted to 7bit.`
-          : "No Base64 HTML part found; encoding .";
+          ? `${converted.decodedCount} encoded HTML part decoded and changed to 7bit.`
+          : "No encoded HTML part found; encoding was not changed.";
+        const commentMessage = converted.commentWrapCount
+          ? `${converted.commentWrapCount} HTML content hidden in comment tag.`
+          : "No HTML content hidden in comment tag.";
+        if (!converted.boundaryRemoved) {
+          setStatus(`MIME boundary not present; content processed normally. ${commentMessage}`, "success");
+          return;
+        }
+        if (converted.commentWrapCount) {
+          setStatus(`${encodingMessage} ${commentMessage} Final boundary removed.`, "success");
+          return;
+        }
         setStatus(
-          `${encodingMessage} ${converted.styleMoveCount} </style> </style> tag moved; final boundary நீக்கப்பட்டது.`,
+          `${encodingMessage} ${converted.styleMoveCount} </style> tag moved; final boundary removed.`,
           "success"
         );
       } catch (error) {
@@ -353,13 +450,13 @@
     });
 
     document.querySelector("#copyButton").addEventListener("click", async () => {
-      if (!output.value) return setStatus("No output available to copy.", "error");
+      if (!output.value) return setStatus("No output to copy.", "error");
       await navigator.clipboard.writeText(output.value);
       setStatus("Output copied to clipboard.", "success");
     });
 
     document.querySelector("#downloadButton").addEventListener("click", () => {
-      if (!output.value) return setStatus("No output available to download.", "error");
+      if (!output.value) return setStatus("No output to download.", "error");
       const blob = new Blob([output.value], { type: "text/plain;charset=utf-8" });
       const link = document.createElement("a");
       link.href = URL.createObjectURL(blob);
